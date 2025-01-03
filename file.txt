@@ -1,0 +1,600 @@
+// Decompiled with JetBrains decompiler
+// Type: AwesomeInventory.Loadout.CompAwesomeInventoryLoadout
+// Assembly: AwesomeInventoryCommon, Version=1.0.8954.21921, Culture=neutral, PublicKeyToken=null
+// MVID: D5B6175F-2632-4C05-929B-FDC206F5F17B
+// Assembly location: G:\SteamLibrary\steamapps\workshop\content\294100\2669036490\1.5\Common\Assemblies\AwesomeInventoryCommon.dll
+
+using AwesomeInventory.Jobs;
+using RimWorld;
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Verse;
+using Verse.AI;
+
+#nullable disable
+namespace AwesomeInventory.Loadout
+{
+  public class CompAwesomeInventoryLoadout : ThingComp
+  {
+    private Pawn _pawn;
+    private bool _initialized;
+    private Dictionary<ThingGroupSelector, CompAwesomeInventoryLoadout.ThresholdState> _bottomThresholdLookup;
+    private List<ThingGroupSelector> _thingSelectors;
+    private List<CompAwesomeInventoryLoadout.ThresholdState> _thresholdStates;
+    private List<Apparel> _apparelsBeforeChanged;
+    private CompAwesomeInventoryLoadout.HotSwapState _hotswapActive = CompAwesomeInventoryLoadout.HotSwapState.Inactive;
+    private AwesomeInventoryCostume _hotswapCostume;
+    private AwesomeInventoryLoadout _loadoutBeforeHotSwap;
+
+    public ThingDef DrugToTake { get; set; }
+
+    public Dictionary<ThingGroupSelector, int> InventoryMargins { get; private set; }
+
+    public AwesomeInventoryLoadout Loadout { get; private set; }
+
+    public bool NeedRestock
+    {
+      get
+      {
+        if (!AwesomeInventoryMod.Settings.UseLoadout || !this._initialized)
+          return false;
+        if (this.Loadout == null)
+        {
+          Log.Error("this.Loadout is out of sync with _initialized in CompAwesomeInventory. This message is harmless.");
+          this.RemoveLoadout();
+          return false;
+        }
+        StringBuilder stringBuilder = new StringBuilder();
+        stringBuilder.Append(((Pawn) this.parent).Name?.ToString() + "'s inventory");
+        stringBuilder.AppendLine();
+        foreach (KeyValuePair<ThingGroupSelector, int> inventoryMargin in this.InventoryMargins)
+        {
+          stringBuilder.AppendFormat(ErrorMessage.ReportString, (object) nameof (NeedRestock), (object) inventoryMargin.Key.LabelCapNoCount, (object) inventoryMargin.Value);
+          stringBuilder.AppendLine();
+        }
+        Log.Warning(stringBuilder.ToString());
+        return this.InventoryMargins.Any<KeyValuePair<ThingGroupSelector, int>>((Func<KeyValuePair<ThingGroupSelector, int>, bool>) (pair => this.ItemNeedsRestock(pair.Key)));
+      }
+    }
+
+    public IEnumerable<KeyValuePair<ThingGroupSelector, int>> ItemsToRestock
+    {
+      get
+      {
+        if (this.NeedRestock)
+        {
+          foreach (KeyValuePair<ThingGroupSelector, int> inventoryMargin in this.InventoryMargins)
+          {
+            KeyValuePair<ThingGroupSelector, int> item = inventoryMargin;
+            if (this.ItemNeedsRestock(item.Key))
+              yield return item;
+            item = new KeyValuePair<ThingGroupSelector, int>();
+          }
+        }
+      }
+    }
+
+    public AwesomeInventoryCostume HotSwapCostume
+    {
+      get => this._hotswapCostume;
+      set => this._hotswapCostume = value;
+    }
+
+    public AwesomeInventoryLoadout LoadoutBeforeHotSwap
+    {
+      get => this._loadoutBeforeHotSwap;
+      set => this._loadoutBeforeHotSwap = value;
+    }
+
+    public CompAwesomeInventoryLoadout.HotSwapState HotswapState
+    {
+      get => this._hotswapActive;
+      set => this._hotswapActive = value;
+    }
+
+    public override void Initialize(CompProperties props)
+    {
+      base.Initialize(props);
+      this._pawn = (Pawn) this.parent;
+    }
+
+    public override void PostSpawnSetup(bool respawningAfterLoad)
+    {
+      Pawn parent;
+      int num;
+      if (respawningAfterLoad || this.Loadout == null)
+      {
+        parent = this.parent as Pawn;
+        num = parent != null ? 1 : 0;
+      }
+      else
+        num = 0;
+      if (num == 0 || !(parent.outfits?.CurrentApparelPolicy is AwesomeInventoryLoadout currentApparelPolicy))
+        return;
+      this.UpdateForNewLoadout(currentApparelPolicy, respawn: true);
+    }
+
+    public void NotifiedAdded(Thing thing)
+    {
+      ValidateArg.NotNull((object) thing, nameof (thing));
+      if (!this._initialized)
+        return;
+      this.Restock(thing);
+    }
+
+    public void NotifiedAddedAndMergedWith(Thing thing, int mergedAmount)
+    {
+      if (!this._initialized)
+        return;
+      this.Restock(thing, mergedAmount);
+    }
+
+    public void NotifiedRemoved(Thing thing)
+    {
+      ValidateArg.NotNull((object) thing, nameof (thing));
+      if (!this._initialized)
+        return;
+      this.DeleteStock(thing);
+    }
+
+    public void NotifiedSplitOff(Thing thing, int count)
+    {
+      if (!this._initialized)
+        return;
+      this.DeleteStock(thing, count);
+    }
+
+    public void UpdateForNewLoadout(
+      AwesomeInventoryLoadout newLoadout,
+      bool delay = false,
+      bool respawn = false,
+      bool forced = false)
+    {
+      if (newLoadout == null || this.Loadout == newLoadout && !forced)
+        return;
+      if (this.InventoryMargins == null)
+      {
+        this.InventoryMargins = new Dictionary<ThingGroupSelector, int>();
+        this._bottomThresholdLookup = new Dictionary<ThingGroupSelector, CompAwesomeInventoryLoadout.ThresholdState>();
+      }
+      else
+      {
+        this.InventoryMargins.Clear();
+        this._bottomThresholdLookup.Clear();
+      }
+      this.Loadout?.RemoveAddNewThingGroupSelectorCallback(new Action<ThingGroupSelector>(this.AddNewThingGroupSelectorCallback));
+      this.Loadout?.RemoveRemoveThingGroupSelectorCallback(new Action<ThingGroupSelector>(this.RemoveThingGroupSelectorCallback));
+      this.Loadout?.RemoveStackCountChangedCallback(new Action<ThingGroupSelector, int>(this.StackCountChangedCallback));
+      this.InitThreshold((IEnumerable<ThingGroupSelector>) newLoadout);
+      this.UpdateInventoryMargin((IEnumerable<ThingGroupSelector>) newLoadout);
+      newLoadout.AddAddNewThingGroupSelectorCallback(new Action<ThingGroupSelector>(this.AddNewThingGroupSelectorCallback));
+      newLoadout.AddRemoveThingGroupSelectorCallback(new Action<ThingGroupSelector>(this.RemoveThingGroupSelectorCallback));
+      newLoadout.AddStackCountChangedCallback(new Action<ThingGroupSelector, int>(this.StackCountChangedCallback));
+      AwesomeInventoryLoadout loadout = this.Loadout;
+      this.Loadout = newLoadout;
+      this._initialized = true;
+      LoadoutManager.Comps.Add(this);
+      this.ChangeCostume(newLoadout, loadout, delay, respawn | forced);
+    }
+
+    public void RemoveLoadout()
+    {
+      this.Loadout?.RemoveAddNewThingGroupSelectorCallback(new Action<ThingGroupSelector>(this.AddNewThingGroupSelectorCallback));
+      this.Loadout?.RemoveRemoveThingGroupSelectorCallback(new Action<ThingGroupSelector>(this.RemoveThingGroupSelectorCallback));
+      this.Loadout?.RemoveStackCountChangedCallback(new Action<ThingGroupSelector, int>(this.StackCountChangedCallback));
+      this.Loadout = (AwesomeInventoryLoadout) null;
+      this.InventoryMargins = (Dictionary<ThingGroupSelector, int>) null;
+      this._bottomThresholdLookup = (Dictionary<ThingGroupSelector, CompAwesomeInventoryLoadout.ThresholdState>) null;
+      this._initialized = false;
+    }
+
+    public override void PostExposeData()
+    {
+      ThingDef drugToTake = this.DrugToTake;
+      base.PostExposeData();
+      Scribe_Collections.Look<ThingGroupSelector, CompAwesomeInventoryLoadout.ThresholdState>(ref this._bottomThresholdLookup, "_bottomThresholdLookup", LookMode.Reference, LookMode.Deep, ref this._thingSelectors, ref this._thresholdStates);
+      Scribe_Collections.Look<Apparel>(ref this._apparelsBeforeChanged, "_apparelsBeforeChanged", LookMode.Reference);
+      Scribe_Values.Look<CompAwesomeInventoryLoadout.HotSwapState>(ref this._hotswapActive, "_hotswapActive", CompAwesomeInventoryLoadout.HotSwapState.Inactive);
+      Scribe_References.Look<AwesomeInventoryCostume>(ref this._hotswapCostume, "_hotswapCostume");
+      Scribe_References.Look<AwesomeInventoryLoadout>(ref this._loadoutBeforeHotSwap, "_loadoutBeforeHotSwap");
+      Scribe_Defs.Look<ThingDef>(ref drugToTake, "DrugToTake");
+      this.DrugToTake = drugToTake;
+    }
+
+    public override IEnumerable<Gizmo> CompGetGizmosExtra()
+    {
+      AwesomeInventorySetting setting = AwesomeInventoryMod.Settings;
+      if (setting.UseToggleGizmo)
+      {
+        if (!(Find.Selector.SingleSelectedThing is Pawn pawn))
+          ;
+        pawn = (Pawn) null;
+      }
+      if (setting.UseLoadout && setting.UseHotSwap && this._pawn.IsColonistPlayerControlled)
+        yield return (Gizmo) new ChangeCostumeInPlace(this._pawn);
+      if (setting.UseTakeDrugs && this._pawn.IsColonistPlayerControlled)
+        yield return (Gizmo) Command_Action_Cacheable.Cache<TakeDrug>.Get((Thing) this._pawn, (object) this._pawn);
+    }
+
+    public virtual CompAwesomeInventoryLoadout.ThingGroupSelectorPool FindPotentialThingGroupSelectors(
+      Thing thing,
+      IEnumerable<ThingGroupSelector> groupSelectors)
+    {
+      ValidateArg.NotNull((object) thing, nameof (thing));
+      return this.FindPotentialThingGroupSelectors(thing, thing.stackCount, groupSelectors);
+    }
+
+    public virtual CompAwesomeInventoryLoadout.ThingGroupSelectorPool FindPotentialThingGroupSelectors(
+      Thing thing,
+      int stackCount,
+      IEnumerable<ThingGroupSelector> groupSelectors)
+    {
+      ValidateArg.NotNull((object) groupSelectors, nameof (groupSelectors));
+      CompAwesomeInventoryLoadout.ThingGroupSelectorPool thingGroupSelectors = new CompAwesomeInventoryLoadout.ThingGroupSelectorPool()
+      {
+        Thing = thing,
+        StackCount = stackCount,
+        OrderedSelectorTuples = new List<Tuple<ThingSelector, ThingGroupSelector>>()
+      };
+      foreach (ThingGroupSelector groupSelector in groupSelectors)
+      {
+        ThingSelector thingSelector;
+        if (groupSelector.Allows(thing, out thingSelector))
+          thingGroupSelectors.OrderedSelectorTuples.Add(Tuple.Create<ThingSelector, ThingGroupSelector>(thingSelector, groupSelector));
+      }
+      if (thingGroupSelectors.OrderedSelectorTuples.Count > 1)
+        thingGroupSelectors.OrderedSelectorTuples = thingGroupSelectors.OrderedSelectorTuples.OrderBy<Tuple<ThingSelector, ThingGroupSelector>, ThingSelector>((Func<Tuple<ThingSelector, ThingGroupSelector>, ThingSelector>) (t => t.Item1), (IComparer<ThingSelector>) ThingSelectorComparer.Instance).ToList<Tuple<ThingSelector, ThingGroupSelector>>();
+      return thingGroupSelectors;
+    }
+
+    protected void ChangeCostume(
+      AwesomeInventoryLoadout newLoadout,
+      AwesomeInventoryLoadout oldLoadout,
+      bool delay,
+      bool keepCache)
+    {
+      ValidateArg.NotNull((object) newLoadout, nameof (newLoadout));
+      if (newLoadout is AwesomeInventoryCostume inventoryCostume && newLoadout != oldLoadout)
+      {
+        if (oldLoadout != null && oldLoadout.GetType() == typeof (AwesomeInventoryLoadout))
+          this._apparelsBeforeChanged = new List<Apparel>((IEnumerable<Apparel>) this._pawn.apparel.WornApparel);
+        else if (!keepCache)
+          this._apparelsBeforeChanged = (List<Apparel>) null;
+        if (ApparelOptionUtility.CapableOfWearing(this._pawn))
+        {
+          if (!inventoryCostume.CostumeItems.Any<ThingGroupSelector>())
+            return;
+          ConcurrentBag<Thing> things = new ConcurrentBag<Thing>();
+          ConcurrentDictionary<Apparel, byte> apparelsToRemove = new ConcurrentDictionary<Apparel, byte>();
+          Parallel.ForEach<ThingGroupSelector>((Partitioner<ThingGroupSelector>) Partitioner.Create<ThingGroupSelector>((IEnumerable<ThingGroupSelector>) inventoryCostume.CostumeItems), (Action<ThingGroupSelector>) (selector =>
+          {
+            Thing thing = this._pawn.inventory.innerContainer.FirstOrDefault<Thing>((Func<Thing, bool>) (t => selector.Allows(t, out ThingSelector _)));
+            if (thing == null)
+              return;
+            foreach (Apparel key in this._pawn.apparel.WornApparel)
+            {
+              if (!ApparelUtility.CanWearTogether(key.def, thing.def, BodyDefOf.Human))
+                apparelsToRemove[key] = (byte) 1;
+            }
+            things.Add(thing);
+          }));
+          if (apparelsToRemove.Any<KeyValuePair<Apparel, byte>>())
+            StartUndressJobs((IEnumerable<Apparel>) apparelsToRemove.Keys, this._pawn);
+          if (things.Any<Thing>())
+          {
+            if (!(this._pawn.CurJobDef == AwesomeInventory_JobDefOf.AwesomeInventory_Undress | delay))
+              this._pawn.jobs.StopAll(true);
+            foreach (Thing targetA in things.Distinct<Thing>())
+            {
+              if (targetA.def.IsApparel)
+              {
+                Job job = (Job) new DressJob(AwesomeInventory_JobDefOf.AwesomeInventory_Dress, (LocalTargetInfo) targetA, false);
+                if (this._pawn.CurJob == null)
+                  this._pawn.jobs.StartJob(job);
+                else
+                  this._pawn.jobs.jobQueue.EnqueueLast(job);
+              }
+              else if (targetA.def.IsWeapon)
+              {
+                Job job = JobMaker.MakeJob(AwesomeInventory_JobDefOf.AwesomeInventory_MapEquip, (LocalTargetInfo) targetA);
+                if (this._pawn.CurJob == null)
+                  this._pawn.jobs.StartJob(job);
+                else
+                  this._pawn.jobs.jobQueue.EnqueueLast(job);
+              }
+            }
+          }
+        }
+        else
+          Messages.Message("AwesomeInventory_NotCapaleChangingApparel".TranslateSimple(), MessageTypeDefOf.NeutralEvent);
+      }
+      else
+      {
+        if (!(oldLoadout is AwesomeInventoryCostume) || !(newLoadout.GetType() == typeof (AwesomeInventoryLoadout)))
+          return;
+        if (ApparelOptionUtility.CapableOfWearing(this._pawn))
+        {
+          if (this._apparelsBeforeChanged != null)
+          {
+            ConcurrentBag<Apparel> apparelsToRemove = new ConcurrentBag<Apparel>();
+            Parallel.ForEach<Apparel>((Partitioner<Apparel>) Partitioner.Create<Apparel>((IEnumerable<Apparel>) this._pawn.apparel.WornApparel), (Action<Apparel>) (apparel =>
+            {
+              if (this._apparelsBeforeChanged.Contains(apparel) || newLoadout.Any<ThingGroupSelector>((Func<ThingGroupSelector, bool>) (s => s.Allows((Thing) apparel, out ThingSelector _))) || this._pawn.outfits.forcedHandler.IsForced(apparel))
+                return;
+              apparelsToRemove.Add(apparel);
+            }));
+            if (apparelsToRemove.Any<Apparel>())
+              StartUndressJobs((IEnumerable<Apparel>) apparelsToRemove, this._pawn);
+            if (!(this._pawn.CurJobDef == AwesomeInventory_JobDefOf.AwesomeInventory_Undress | delay))
+              this._pawn.jobs?.StopAll(true);
+            foreach (Apparel apparel in this._apparelsBeforeChanged)
+            {
+              if (this._pawn.inventory.innerContainer.Contains((Thing) apparel))
+              {
+                Job job = (Job) new DressJob(AwesomeInventory_JobDefOf.AwesomeInventory_Dress, (LocalTargetInfo) (Thing) apparel, false);
+                if (this._pawn.CurJob == null)
+                  this._pawn.jobs?.StartJob(job);
+                else
+                  this._pawn.jobs?.jobQueue.EnqueueLast(job);
+              }
+            }
+            this._apparelsBeforeChanged = (List<Apparel>) null;
+          }
+        }
+        else
+          Messages.Message("AwesomeInventory_NotCapaleChangingApparel".TranslateSimple(), MessageTypeDefOf.NeutralEvent);
+      }
+
+      void StartUndressJobs(IEnumerable<Apparel> apparels, Pawn pawn)
+      {
+        if (apparels == null || pawn?.jobs == null)
+          return;
+        if (!delay)
+          pawn.jobs.StopAll(true);
+        foreach (Apparel apparel in apparels)
+        {
+          if (apparel != null)
+          {
+            Job job = JobMaker.MakeJob(AwesomeInventory_JobDefOf.AwesomeInventory_Undress, (LocalTargetInfo) (Thing) apparel);
+            if (pawn.CurJob == null)
+              pawn.jobs.StartJob(job);
+            else
+              pawn.jobs.jobQueue.EnqueueLast(job);
+          }
+        }
+      }
+    }
+
+    protected virtual void AddNewThingGroupSelectorCallback(ThingGroupSelector groupSelector)
+    {
+      ValidateArg.NotNull((object) groupSelector, nameof (groupSelector));
+      if (groupSelector.UseBottomThreshold)
+      {
+        CompAwesomeInventoryLoadout.ThresholdState thresholdState = new CompAwesomeInventoryLoadout.ThresholdState()
+        {
+          NegBottomThresholdCount = groupSelector.BottomThresoldCount - groupSelector.AllowedStackCount,
+          CanRestock = true
+        };
+        this._bottomThresholdLookup[groupSelector] = thresholdState;
+      }
+      List<ThingGroupSelector> list = this.InventoryMargins.Where<KeyValuePair<ThingGroupSelector, int>>((Func<KeyValuePair<ThingGroupSelector, int>, bool>) (pair => ThingDefComparer.Instance.Equals(pair.Key.AllowedThing, groupSelector.AllowedThing))).Select<KeyValuePair<ThingGroupSelector, int>, ThingGroupSelector>((Func<KeyValuePair<ThingGroupSelector, int>, ThingGroupSelector>) (pair => pair.Key)).ToList<ThingGroupSelector>();
+      list.Add(groupSelector);
+      this.UpdateInventoryMargin((IEnumerable<ThingGroupSelector>) list);
+      this.UpdateThreshold((IEnumerable<ThingGroupSelector>) new ThingGroupSelector[1]
+      {
+        groupSelector
+      });
+    }
+
+    protected virtual void StackCountChangedCallback(
+      ThingGroupSelector groupSelector,
+      int oldStackCount)
+    {
+      ValidateArg.NotNull((object) groupSelector, nameof (groupSelector));
+      this.InventoryMargins[groupSelector] += oldStackCount - groupSelector.AllowedStackCount;
+      this.UpdateThreshold((IEnumerable<ThingGroupSelector>) new ThingGroupSelector[1]
+      {
+        groupSelector
+      });
+    }
+
+    protected virtual void RemoveThingGroupSelectorCallback(ThingGroupSelector groupSelector)
+    {
+      this.InventoryMargins.Remove(groupSelector);
+      this._bottomThresholdLookup.Remove(groupSelector);
+    }
+
+    protected virtual void Restock(Thing thing)
+    {
+      ValidateArg.NotNull((object) thing, nameof (thing));
+      if (thing.stackCount <= 0)
+      {
+        Log.Error(AIDebug.Header + "Thing count is equal to or less than 0, reset to 1");
+        thing.stackCount = 1;
+      }
+      this.Restock(thing, thing.stackCount);
+    }
+
+    protected virtual void Restock(Thing thing, int reStockCount)
+    {
+      this.Restock(this.FindPotentialThingGroupSelectors(thing, reStockCount, (IEnumerable<ThingGroupSelector>) this.InventoryMargins.Keys));
+    }
+
+    protected virtual void Restock(
+      CompAwesomeInventoryLoadout.ThingGroupSelectorPool pool)
+    {
+      int num = pool.StackCount;
+      foreach (Tuple<ThingSelector, ThingGroupSelector> orderedSelectorTuple in pool.OrderedSelectorTuples)
+      {
+        if (!orderedSelectorTuple.Item2.UseBottomThreshold || this._bottomThresholdLookup[orderedSelectorTuple.Item2].CanRestock)
+        {
+          if (this.InventoryMargins[orderedSelectorTuple.Item2] + num <= 0)
+          {
+            this.InventoryMargins[orderedSelectorTuple.Item2] += num;
+            if (this.InventoryMargins[orderedSelectorTuple.Item2] == 0)
+              this.UpdateThreshold((IEnumerable<ThingGroupSelector>) new ThingGroupSelector[1]
+              {
+                orderedSelectorTuple.Item2
+              });
+            num = 0;
+            break;
+          }
+          num += this.InventoryMargins[orderedSelectorTuple.Item2];
+          this.InventoryMargins[orderedSelectorTuple.Item2] = 0;
+          this.UpdateThreshold((IEnumerable<ThingGroupSelector>) new ThingGroupSelector[1]
+          {
+            orderedSelectorTuple.Item2
+          });
+        }
+      }
+      if (!pool.OrderedSelectorTuples.Any<Tuple<ThingSelector, ThingGroupSelector>>() || num == 0)
+        return;
+      this.InventoryMargins[pool.OrderedSelectorTuples.First<Tuple<ThingSelector, ThingGroupSelector>>().Item2] += num;
+    }
+
+    protected virtual void DeleteStock(Thing thing)
+    {
+      ValidateArg.NotNull((object) thing, nameof (thing));
+      this.DeleteStock(thing, thing.stackCount);
+    }
+
+    protected virtual void DeleteStock(Thing thing, int stackCountToDelete)
+    {
+      CompAwesomeInventoryLoadout.ThingGroupSelectorPool thingGroupSelectors = this.FindPotentialThingGroupSelectors(thing, stackCountToDelete, (IEnumerable<ThingGroupSelector>) this.InventoryMargins.Keys);
+      foreach (Tuple<ThingSelector, ThingGroupSelector> orderedSelectorTuple in thingGroupSelectors.OrderedSelectorTuples)
+      {
+        int num = orderedSelectorTuple.Item2.AllowedStackCount * -1;
+        if (this.InventoryMargins[orderedSelectorTuple.Item2] - thingGroupSelectors.StackCount < num)
+        {
+          thingGroupSelectors.StackCount -= this.InventoryMargins[orderedSelectorTuple.Item2] - num;
+          this.InventoryMargins[orderedSelectorTuple.Item2] = num;
+          this.UpdateThreshold((IEnumerable<ThingGroupSelector>) new ThingGroupSelector[1]
+          {
+            orderedSelectorTuple.Item2
+          });
+        }
+        else
+        {
+          this.InventoryMargins[orderedSelectorTuple.Item2] -= thingGroupSelectors.StackCount;
+          this.UpdateThreshold((IEnumerable<ThingGroupSelector>) new ThingGroupSelector[1]
+          {
+            orderedSelectorTuple.Item2
+          });
+          break;
+        }
+      }
+      if (!thingGroupSelectors.OrderedSelectorTuples.Any<Tuple<ThingSelector, ThingGroupSelector>>((Predicate<Tuple<ThingSelector, ThingGroupSelector>>) (t => t.Item2.UseBottomThreshold && this._bottomThresholdLookup[t.Item2].CanRestock)))
+        return;
+      this.UpdateInventoryMargin(thingGroupSelectors.OrderedSelectorTuples.Select<Tuple<ThingSelector, ThingGroupSelector>, ThingGroupSelector>((Func<Tuple<ThingSelector, ThingGroupSelector>, ThingGroupSelector>) (t => t.Item2)));
+    }
+
+    private void UpdateInventoryMargin(IEnumerable<ThingGroupSelector> groupSelectors)
+    {
+      ValidateArg.NotNull((object) groupSelectors, nameof (groupSelectors));
+      if (!groupSelectors.Any<ThingGroupSelector>())
+        return;
+      foreach (ThingGroupSelector groupSelector in groupSelectors)
+        this.InventoryMargins[groupSelector] = groupSelector.AllowedStackCount * -1;
+      ConcurrentBag<CompAwesomeInventoryLoadout.ThingGroupSelectorPool> pools = new ConcurrentBag<CompAwesomeInventoryLoadout.ThingGroupSelectorPool>();
+      Parallel.ForEach<Thing>((Partitioner<Thing>) Partitioner.Create<Thing>((IEnumerable<Thing>) InventoryUtility.MakeListForPawnGearAndInventory(this._pawn)), (Action<Thing>) (thing =>
+      {
+        CompAwesomeInventoryLoadout.ThingGroupSelectorPool thingGroupSelectors = this.FindPotentialThingGroupSelectors(thing, groupSelectors);
+        if (!thingGroupSelectors.OrderedSelectorTuples.Any<Tuple<ThingSelector, ThingGroupSelector>>())
+          return;
+        pools.Add(thingGroupSelectors);
+      }));
+      foreach (CompAwesomeInventoryLoadout.ThingGroupSelectorPool pool in pools)
+        this.Restock(pool);
+    }
+
+    private void UpdateThreshold(IEnumerable<ThingGroupSelector> groupSelectors)
+    {
+      if (!groupSelectors.Any<ThingGroupSelector>())
+        return;
+      foreach (ThingGroupSelector groupSelector in groupSelectors)
+      {
+        if (groupSelector.UseBottomThreshold)
+        {
+          CompAwesomeInventoryLoadout.ThresholdState thresholdState;
+          if (this._bottomThresholdLookup.TryGetValue(groupSelector, out thresholdState))
+          {
+            if (this.InventoryMargins[groupSelector] >= 0)
+            {
+              thresholdState.CanRestock = false;
+              thresholdState.NegBottomThresholdCount = groupSelector.BottomThresoldCount - groupSelector.AllowedStackCount;
+              this._bottomThresholdLookup[groupSelector] = thresholdState;
+            }
+            else
+            {
+              thresholdState.NegBottomThresholdCount = groupSelector.BottomThresoldCount - groupSelector.AllowedStackCount;
+              thresholdState.CanRestock = thresholdState.NegBottomThresholdCount >= this.InventoryMargins[groupSelector] || thresholdState.CanRestock;
+              this._bottomThresholdLookup[groupSelector] = thresholdState;
+            }
+          }
+          else
+          {
+            thresholdState = new CompAwesomeInventoryLoadout.ThresholdState()
+            {
+              NegBottomThresholdCount = groupSelector.BottomThresoldCount - groupSelector.AllowedStackCount
+            };
+            thresholdState.CanRestock = this.InventoryMargins[groupSelector] <= thresholdState.NegBottomThresholdCount;
+            this._bottomThresholdLookup[groupSelector] = thresholdState;
+          }
+        }
+        else
+          this._bottomThresholdLookup.Remove(groupSelector);
+      }
+    }
+
+    private void InitThreshold(IEnumerable<ThingGroupSelector> groupSelectors)
+    {
+      if (this._bottomThresholdLookup.Any<KeyValuePair<ThingGroupSelector, CompAwesomeInventoryLoadout.ThresholdState>>())
+        return;
+      foreach (ThingGroupSelector groupSelector in groupSelectors)
+      {
+        if (groupSelector.UseBottomThreshold)
+          this._bottomThresholdLookup[groupSelector] = new CompAwesomeInventoryLoadout.ThresholdState()
+          {
+            NegBottomThresholdCount = groupSelector.BottomThresoldCount - groupSelector.AllowedStackCount,
+            CanRestock = true
+          };
+      }
+    }
+
+    private bool ItemNeedsRestock(ThingGroupSelector groupSelector)
+    {
+      CompAwesomeInventoryLoadout.ThresholdState thresholdState;
+      return this.InventoryMargins[groupSelector] < 0 && (!this._bottomThresholdLookup.TryGetValue(groupSelector, out thresholdState) || thresholdState.CanRestock);
+    }
+
+    public enum HotSwapState
+    {
+      Active,
+      Interuppted,
+      Inactive,
+    }
+
+    private class ThresholdState : IExposable
+    {
+      public bool CanRestock;
+      public int NegBottomThresholdCount;
+
+      public void ExposeData()
+      {
+        Scribe_Values.Look<bool>(ref this.CanRestock, "CanRestock", forceSave: true);
+        Scribe_Values.Look<int>(ref this.NegBottomThresholdCount, "NegBottomThresholdCount", forceSave: true);
+      }
+    }
+
+    public struct ThingGroupSelectorPool
+    {
+      public Thing Thing;
+      public int StackCount;
+      public List<Tuple<ThingSelector, ThingGroupSelector>> OrderedSelectorTuples;
+    }
+  }
+}
