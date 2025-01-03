@@ -48,15 +48,6 @@ To ensure proper functionality, load this mod after the following mods:
 
 Contributions are welcome! If you have suggestions for improvements or find any issues, please open an issue or submit a pull request.
 
-## License
-
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-- Thanks to the RimWorld community for their support and feedback.
-- Special thanks to the authors of the dependencies for their hard work.
-
 ## Contact
 
 For any inquiries, please contact the author:
